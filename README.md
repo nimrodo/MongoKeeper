@@ -86,6 +86,23 @@ mongosh --port 27017 --eval "rs.initiate()"
 Either way, point the driver at it with a `replicaSet` connection string parameter, e.g.
 `mongodb://localhost:27017/?replicaSet=rs0`.
 
+### Standalone `mongod` (no replica set)
+
+If a replica set genuinely isn't available, `TrackedCollection::new_standalone` /
+`with_history_name_standalone` construct a collection that never uses transactions:
+
+```rust
+let orders: TrackedCollection<Order> = TrackedCollection::new_standalone(&db, "orders");
+```
+
+This trades away atomicity: archiving and mutating become two independent operations instead
+of one, so a crash between them (or a partial failure archiving multiple documents for
+`update_many`/`delete_many`/`bulk_write`) can leave a harmless orphaned history entry — a
+pre-image was archived but the corresponding mutation never happened, so the entry just
+duplicates the document's current state. It can never produce a mutation whose pre-image was
+never archived. There's also no automatic retry on transient errors in this mode. Prefer the
+transactional constructors whenever a replica set is available.
+
 ## Usage
 
 ```rust

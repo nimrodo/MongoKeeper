@@ -669,3 +669,273 @@ async fn insert_many_inserts_documents_without_archiving() {
     let history_count = widgets.history().count_documents(doc! {}).await.unwrap();
     assert_eq!(history_count, 0);
 }
+
+#[tokio::test]
+async fn standalone_update_one_archives_and_mutates() {
+    let db = test_db("standalone_update_one").await;
+    let widgets: TrackedCollection<Widget> = TrackedCollection::new_standalone(&db, "widgets");
+    let id = ObjectId::new();
+    widgets
+        .insert_one(Widget {
+            id,
+            name: "clip".to_string(),
+            count: 1,
+        })
+        .await
+        .unwrap();
+
+    widgets
+        .update_one(doc! { "_id": id }, doc! { "$set": { "count": 2 } })
+        .await
+        .unwrap();
+
+    let history: Vec<_> = widgets
+        .history()
+        .find(doc! { "document._id": id })
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].operation, Operation::Update);
+    assert_eq!(history[0].document.count, 1);
+
+    let current = widgets
+        .collection()
+        .find_one(doc! { "_id": id })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.count, 2);
+}
+
+#[tokio::test]
+async fn standalone_replace_one_archives_and_mutates() {
+    let db = test_db("standalone_replace_one").await;
+    let widgets: TrackedCollection<Widget> = TrackedCollection::new_standalone(&db, "widgets");
+    let id = ObjectId::new();
+    widgets
+        .insert_one(Widget {
+            id,
+            name: "latch".to_string(),
+            count: 1,
+        })
+        .await
+        .unwrap();
+
+    widgets
+        .replace_one(
+            doc! { "_id": id },
+            Widget {
+                id,
+                name: "latch-v2".to_string(),
+                count: 10,
+            },
+        )
+        .await
+        .unwrap();
+
+    let history: Vec<_> = widgets
+        .history()
+        .find(doc! { "document._id": id })
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].operation, Operation::Replace);
+    assert_eq!(history[0].document.name, "latch");
+
+    let current = widgets
+        .collection()
+        .find_one(doc! { "_id": id })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.name, "latch-v2");
+}
+
+#[tokio::test]
+async fn standalone_delete_one_archives_and_deletes() {
+    let db = test_db("standalone_delete_one").await;
+    let widgets: TrackedCollection<Widget> = TrackedCollection::new_standalone(&db, "widgets");
+    let id = ObjectId::new();
+    widgets
+        .insert_one(Widget {
+            id,
+            name: "pivot".to_string(),
+            count: 1,
+        })
+        .await
+        .unwrap();
+
+    widgets.delete_one(doc! { "_id": id }).await.unwrap();
+
+    let history: Vec<_> = widgets
+        .history()
+        .find(doc! { "document._id": id })
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].operation, Operation::Delete);
+
+    let current = widgets
+        .collection()
+        .find_one(doc! { "_id": id })
+        .await
+        .unwrap();
+    assert!(current.is_none());
+}
+
+#[tokio::test]
+async fn standalone_update_many_archives_one_entry_per_matched_document() {
+    let db = test_db("standalone_update_many").await;
+    let widgets: TrackedCollection<Widget> = TrackedCollection::new_standalone(&db, "widgets");
+    for _ in 0..3 {
+        widgets
+            .insert_one(Widget {
+                id: ObjectId::new(),
+                name: "collar".to_string(),
+                count: 1,
+            })
+            .await
+            .unwrap();
+    }
+
+    widgets
+        .update_many(
+            doc! { "name": "collar" },
+            doc! { "$set": { "count": 5 } },
+        )
+        .await
+        .unwrap();
+
+    let history: Vec<_> = widgets
+        .history()
+        .find(doc! {})
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 3);
+    assert!(history.iter().all(|e| e.operation == Operation::Update));
+}
+
+#[tokio::test]
+async fn standalone_delete_many_archives_one_entry_per_matched_document() {
+    let db = test_db("standalone_delete_many").await;
+    let widgets: TrackedCollection<Widget> = TrackedCollection::new_standalone(&db, "widgets");
+    for _ in 0..3 {
+        widgets
+            .insert_one(Widget {
+                id: ObjectId::new(),
+                name: "grommet".to_string(),
+                count: 1,
+            })
+            .await
+            .unwrap();
+    }
+
+    widgets
+        .delete_many(doc! { "name": "grommet" })
+        .await
+        .unwrap();
+
+    let history: Vec<_> = widgets
+        .history()
+        .find(doc! {})
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 3);
+    assert!(history.iter().all(|e| e.operation == Operation::Delete));
+
+    let remaining = widgets
+        .collection()
+        .count_documents(doc! {})
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[tokio::test]
+async fn standalone_bulk_write_mixed_operations_archives_correctly() {
+    let db = test_db("standalone_bulk_write").await;
+    let widgets: TrackedCollection<Widget> = TrackedCollection::new_standalone(&db, "widgets");
+    let update_id = ObjectId::new();
+    let delete_id = ObjectId::new();
+    widgets
+        .insert_one(Widget {
+            id: update_id,
+            name: "flange".to_string(),
+            count: 1,
+        })
+        .await
+        .unwrap();
+    widgets
+        .insert_one(Widget {
+            id: delete_id,
+            name: "sleeve".to_string(),
+            count: 1,
+        })
+        .await
+        .unwrap();
+
+    let insert_id = ObjectId::new();
+    let summary = widgets
+        .bulk_write(vec![
+            BulkWriteModel::InsertOne(Widget {
+                id: insert_id,
+                name: "dowel".to_string(),
+                count: 1,
+            }),
+            BulkWriteModel::UpdateOne {
+                filter: doc! { "_id": update_id },
+                update: doc! { "$set": { "count": 2 } },
+            },
+            BulkWriteModel::DeleteOne {
+                filter: doc! { "_id": delete_id },
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(summary.inserted_count, 1);
+    assert_eq!(summary.modified_count, 1);
+    assert_eq!(summary.deleted_count, 1);
+
+    let history: Vec<_> = widgets
+        .history()
+        .find(doc! {})
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2);
+
+    assert!(
+        widgets
+            .collection()
+            .find_one(doc! { "_id": insert_id })
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        widgets
+            .collection()
+            .find_one(doc! { "_id": delete_id })
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

@@ -5,6 +5,7 @@ use std::borrow::Borrow;
 use std::time::{Duration, Instant, SystemTime};
 
 use bson::{Document, doc};
+use futures_util::TryStreamExt;
 use mongodb::error::{TRANSIENT_TRANSACTION_ERROR, UNKNOWN_TRANSACTION_COMMIT_RESULT};
 use mongodb::options::{
     DeleteManyModel, DeleteOneModel, IndexOptions, UpdateManyModel, UpdateModifications,
@@ -42,6 +43,20 @@ const RETRY_TIMEOUT: Duration = Duration::from_secs(120);
 /// standalone `mongod` does not support them. For local development, initialize a
 /// single-node replica set (see the crate README).
 ///
+/// # Non-transactional mode
+///
+/// [`new_standalone`](Self::new_standalone) and
+/// [`with_history_name_standalone`](Self::with_history_name_standalone) construct a
+/// `TrackedCollection` that never uses transactions, for standalone `mongod` deployments that
+/// can't support them. This trades away atomicity: archiving and mutating become two
+/// independent operations instead of one, so a crash between them (or a partial failure
+/// archiving multiple documents for `update_many`/`delete_many`/`bulk_write`) can leave a
+/// harmless orphaned history entry — a pre-image was archived but the corresponding mutation
+/// never happened, so the archived entry simply duplicates the document's current state. It
+/// can never produce a mutation whose pre-image was never archived. There is also no retry on
+/// transient errors in this mode, since the transaction-specific error labels this crate
+/// retries on don't apply outside a transaction.
+///
 /// # Example
 ///
 /// ```no_run
@@ -71,6 +86,7 @@ pub struct TrackedCollection<T: Send + Sync> {
     client: Client,
     collection: Collection<T>,
     history: Collection<HistoryEntry<T>>,
+    transactional: bool,
 }
 
 /// A single operation to submit as part of a [`TrackedCollection::bulk_write`] call, scoped to
@@ -127,10 +143,38 @@ where
     /// Wraps `collection_name` in `db`, storing history in `history_name` instead of the
     /// default `"<collection_name>_history"`.
     pub fn with_history_name(db: &Database, collection_name: &str, history_name: &str) -> Self {
+        Self::new_impl(db, collection_name, history_name, true)
+    }
+
+    /// Like [`new`](Self::new), but never uses transactions — see the "Non-transactional
+    /// mode" section on this type's docs for the consistency tradeoff this implies.
+    pub fn new_standalone(db: &Database, collection_name: &str) -> Self {
+        let history_name = format!("{collection_name}_history");
+        Self::with_history_name_standalone(db, collection_name, &history_name)
+    }
+
+    /// Like [`with_history_name`](Self::with_history_name), but never uses transactions — see
+    /// the "Non-transactional mode" section on this type's docs for the consistency tradeoff
+    /// this implies.
+    pub fn with_history_name_standalone(
+        db: &Database,
+        collection_name: &str,
+        history_name: &str,
+    ) -> Self {
+        Self::new_impl(db, collection_name, history_name, false)
+    }
+
+    fn new_impl(
+        db: &Database,
+        collection_name: &str,
+        history_name: &str,
+        transactional: bool,
+    ) -> Self {
         Self {
             client: db.client().clone(),
             collection: db.collection(collection_name),
             history: db.collection(history_name),
+            transactional,
         }
     }
 
@@ -198,57 +242,102 @@ where
     }
 
     /// Archives the current version of every document matching `filter`, then applies
-    /// `update` to it, atomically.
+    /// `update` to it. Atomic unless this instance was constructed with
+    /// [`new_standalone`](Self::new_standalone)/
+    /// [`with_history_name_standalone`](Self::with_history_name_standalone) — see the
+    /// "Non-transactional mode" section on this type's docs.
     pub async fn update_one(&self, filter: Document, update: Document) -> Result<UpdateResult> {
-        self.run_transaction(filter, Operation::Update, async |session, filter| {
-            self.collection
-                .update_one(filter, update.clone())
-                .session(session)
-                .await
-        })
-        .await
+        if self.transactional {
+            self.run_transaction(filter, Operation::Update, async |session, filter| {
+                self.collection
+                    .update_one(filter, update.clone())
+                    .session(session)
+                    .await
+            })
+            .await
+        } else {
+            self.archive_matching_standalone(filter.clone(), Operation::Update)
+                .await?;
+            Ok(self.collection.update_one(filter, update).await?)
+        }
     }
 
     /// Archives the current version of every document matching `filter`, then applies
-    /// `update` to all of them, atomically.
+    /// `update` to all of them. Atomic unless this instance was constructed with
+    /// [`new_standalone`](Self::new_standalone)/
+    /// [`with_history_name_standalone`](Self::with_history_name_standalone) — see the
+    /// "Non-transactional mode" section on this type's docs.
     pub async fn update_many(&self, filter: Document, update: Document) -> Result<UpdateResult> {
-        self.run_transaction(filter, Operation::Update, async |session, filter| {
-            self.collection
-                .update_many(filter, update.clone())
-                .session(session)
-                .await
-        })
-        .await
+        if self.transactional {
+            self.run_transaction(filter, Operation::Update, async |session, filter| {
+                self.collection
+                    .update_many(filter, update.clone())
+                    .session(session)
+                    .await
+            })
+            .await
+        } else {
+            self.archive_matching_standalone(filter.clone(), Operation::Update)
+                .await?;
+            Ok(self.collection.update_many(filter, update).await?)
+        }
     }
 
     /// Archives the current version of the document matching `filter`, then replaces it
-    /// with `replacement`, atomically.
+    /// with `replacement`. Atomic unless this instance was constructed with
+    /// [`new_standalone`](Self::new_standalone)/
+    /// [`with_history_name_standalone`](Self::with_history_name_standalone) — see the
+    /// "Non-transactional mode" section on this type's docs.
     pub async fn replace_one(&self, filter: Document, replacement: T) -> Result<UpdateResult> {
-        self.run_transaction(filter, Operation::Replace, async |session, filter| {
-            self.collection
-                .replace_one(filter, replacement.clone())
-                .session(session)
-                .await
-        })
-        .await
+        if self.transactional {
+            self.run_transaction(filter, Operation::Replace, async |session, filter| {
+                self.collection
+                    .replace_one(filter, replacement.clone())
+                    .session(session)
+                    .await
+            })
+            .await
+        } else {
+            self.archive_matching_standalone(filter.clone(), Operation::Replace)
+                .await?;
+            Ok(self.collection.replace_one(filter, replacement).await?)
+        }
     }
 
-    /// Archives the current version of the document matching `filter`, then deletes it,
-    /// atomically.
+    /// Archives the current version of the document matching `filter`, then deletes it.
+    /// Atomic unless this instance was constructed with
+    /// [`new_standalone`](Self::new_standalone)/
+    /// [`with_history_name_standalone`](Self::with_history_name_standalone) — see the
+    /// "Non-transactional mode" section on this type's docs.
     pub async fn delete_one(&self, filter: Document) -> Result<DeleteResult> {
-        self.run_transaction(filter, Operation::Delete, async |session, filter| {
-            self.collection.delete_one(filter).session(session).await
-        })
-        .await
+        if self.transactional {
+            self.run_transaction(filter, Operation::Delete, async |session, filter| {
+                self.collection.delete_one(filter).session(session).await
+            })
+            .await
+        } else {
+            self.archive_matching_standalone(filter.clone(), Operation::Delete)
+                .await?;
+            Ok(self.collection.delete_one(filter).await?)
+        }
     }
 
     /// Archives the current version of every document matching `filter`, then deletes all
-    /// of them, atomically.
+    /// of them. Atomic unless this instance was constructed with
+    /// [`new_standalone`](Self::new_standalone)/
+    /// [`with_history_name_standalone`](Self::with_history_name_standalone) — see the
+    /// "Non-transactional mode" section on this type's docs.
     pub async fn delete_many(&self, filter: Document) -> Result<DeleteResult> {
-        self.run_transaction(filter, Operation::Delete, async |session, filter| {
-            self.collection.delete_many(filter).session(session).await
-        })
-        .await
+        if self.transactional {
+            self.run_transaction(filter, Operation::Delete, async |session, filter| {
+                self.collection.delete_many(filter).session(session).await
+            })
+            .await
+        } else {
+            self.archive_matching_standalone(filter.clone(), Operation::Delete)
+                .await?;
+            Ok(self.collection.delete_many(filter).await?)
+        }
     }
 
     /// Submits every model in `models` as a single MongoDB `bulkWrite` command, archiving the
@@ -291,18 +380,30 @@ where
         &self,
         models: Vec<BulkWriteModel<T>>,
     ) -> Result<SummaryBulkWriteResult> {
-        self.with_transaction(async |session| {
+        if self.transactional {
+            self.with_transaction(async |session| {
+                let mut write_models = Vec::with_capacity(models.len());
+                for model in &models {
+                    if let Some((filter, operation)) = model.archive_target() {
+                        self.archive_matching(session, filter, operation).await?;
+                    }
+                    write_models.push(model.to_write_model(&self.collection)?);
+                }
+
+                self.client.bulk_write(write_models).session(session).await
+            })
+            .await
+        } else {
             let mut write_models = Vec::with_capacity(models.len());
             for model in &models {
                 if let Some((filter, operation)) = model.archive_target() {
-                    self.archive_matching(session, filter, operation).await?;
+                    self.archive_matching_standalone(filter, operation).await?;
                 }
                 write_models.push(model.to_write_model(&self.collection)?);
             }
 
-            self.client.bulk_write(write_models).session(session).await
-        })
-        .await
+            Ok(self.client.bulk_write(write_models).await?)
+        }
     }
 
     /// Runs the archive-then-mutate pattern shared by every single-operation mutating method
@@ -388,6 +489,32 @@ where
 
         if !entries.is_empty() {
             self.history.insert_many(entries).session(session).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Like [`archive_matching`](Self::archive_matching), but without a session — the
+    /// non-transactional counterpart used when this instance was constructed with
+    /// [`new_standalone`](Self::new_standalone)/
+    /// [`with_history_name_standalone`](Self::with_history_name_standalone).
+    async fn archive_matching_standalone(
+        &self,
+        filter: Document,
+        operation: Operation,
+    ) -> mongodb::error::Result<()> {
+        let mut cursor = self.collection.find(filter).await?;
+        let mut entries = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            entries.push(HistoryEntry {
+                archived_at: bson::DateTime::now(),
+                operation,
+                document,
+            });
+        }
+
+        if !entries.is_empty() {
+            self.history.insert_many(entries).await?;
         }
 
         Ok(())
