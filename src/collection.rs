@@ -1,6 +1,7 @@
 //! [`TrackedCollection`], a MongoDB collection wrapper that archives previous document
 //! versions on update, replace, and delete.
 
+use std::borrow::Borrow;
 use std::time::{Duration, Instant, SystemTime};
 
 use bson::{Document, doc};
@@ -9,7 +10,9 @@ use mongodb::options::{
     DeleteManyModel, DeleteOneModel, IndexOptions, UpdateManyModel, UpdateModifications,
     UpdateOneModel, WriteModel,
 };
-use mongodb::results::{DeleteResult, SummaryBulkWriteResult, UpdateResult};
+use mongodb::results::{
+    DeleteResult, InsertManyResult, InsertOneResult, SummaryBulkWriteResult, UpdateResult,
+};
 use mongodb::{Client, ClientSession, Collection, Database, IndexModel};
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -132,7 +135,7 @@ where
     }
 
     /// The wrapped main collection, for reads and any operation not covered by this type
-    /// (e.g. `find`, `find_one`, `insert_one`, aggregation).
+    /// (e.g. `find`, `find_one`, aggregation).
     pub fn collection(&self) -> &Collection<T> {
         &self.collection
     }
@@ -175,6 +178,23 @@ where
             .delete_many(doc! { "archived_at": { "$lt": cutoff } })
             .await?;
         Ok(result.deleted_count)
+    }
+
+    /// Inserts `document`. Nothing is archived, since there is no previous version of a new
+    /// document. A thin passthrough to the wrapped collection's `insert_one`, provided so
+    /// callers don't need to reach through `.collection()` for the one CRUD operation that has
+    /// nothing to archive.
+    pub async fn insert_one(&self, document: impl Borrow<T> + Send) -> Result<InsertOneResult> {
+        Ok(self.collection.insert_one(document).await?)
+    }
+
+    /// Inserts `documents`. Nothing is archived, since there is no previous version of a new
+    /// document. A thin passthrough to the wrapped collection's `insert_many`.
+    pub async fn insert_many(
+        &self,
+        documents: impl IntoIterator<Item = impl Borrow<T>> + Send,
+    ) -> Result<InsertManyResult> {
+        Ok(self.collection.insert_many(documents).await?)
     }
 
     /// Archives the current version of every document matching `filter`, then applies
@@ -280,10 +300,7 @@ where
                 write_models.push(model.to_write_model(&self.collection)?);
             }
 
-            self.client
-                .bulk_write(write_models)
-                .session(session)
-                .await
+            self.client.bulk_write(write_models).session(session).await
         })
         .await
     }
@@ -386,7 +403,8 @@ where
     fn archive_target(&self) -> Option<(Document, Operation)> {
         match self {
             BulkWriteModel::InsertOne(_) => None,
-            BulkWriteModel::UpdateOne { filter, .. } | BulkWriteModel::UpdateMany { filter, .. } => {
+            BulkWriteModel::UpdateOne { filter, .. }
+            | BulkWriteModel::UpdateMany { filter, .. } => {
                 Some((filter.clone(), Operation::Update))
             }
             BulkWriteModel::ReplaceOne { filter, .. } => Some((filter.clone(), Operation::Replace)),
@@ -401,9 +419,7 @@ where
     fn to_write_model(&self, collection: &Collection<T>) -> mongodb::error::Result<WriteModel> {
         let namespace = collection.namespace();
         Ok(match self {
-            BulkWriteModel::InsertOne(document) => {
-                collection.insert_one_model(document)?.into()
-            }
+            BulkWriteModel::InsertOne(document) => collection.insert_one_model(document)?.into(),
             BulkWriteModel::UpdateOne { filter, update } => UpdateOneModel::builder()
                 .namespace(namespace)
                 .filter(filter.clone())
@@ -416,7 +432,10 @@ where
                 .update(UpdateModifications::Document(update.clone()))
                 .build()
                 .into(),
-            BulkWriteModel::ReplaceOne { filter, replacement } => collection
+            BulkWriteModel::ReplaceOne {
+                filter,
+                replacement,
+            } => collection
                 .replace_one_model(filter.clone(), replacement)?
                 .into(),
             BulkWriteModel::DeleteOne { filter } => DeleteOneModel::builder()

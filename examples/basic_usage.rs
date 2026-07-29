@@ -35,7 +35,7 @@ async fn main() -> mongokeeper::Result<()> {
         total: 42,
         status: "pending".to_string(),
     };
-    orders.collection().insert_one(order.clone()).await?;
+    orders.insert_one(order.clone()).await?;
     println!("Inserted order {}", order.id);
 
     orders

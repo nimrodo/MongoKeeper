@@ -40,7 +40,6 @@ async fn update_one_archives_pre_image() {
     let widgets: TrackedCollection<Widget> = TrackedCollection::new(&db, "widgets");
     let id = ObjectId::new();
     widgets
-        .collection()
         .insert_one(Widget {
             id,
             name: "sprocket".to_string(),
@@ -83,7 +82,6 @@ async fn update_many_archives_one_entry_per_matched_document() {
     let ids = [ObjectId::new(), ObjectId::new(), ObjectId::new()];
     for id in ids {
         widgets
-            .collection()
             .insert_one(Widget {
                 id,
                 name: "gear".to_string(),
@@ -94,10 +92,7 @@ async fn update_many_archives_one_entry_per_matched_document() {
     }
 
     widgets
-        .update_many(
-            doc! { "name": "gear" },
-            doc! { "$set": { "count": 5 } },
-        )
+        .update_many(doc! { "name": "gear" }, doc! { "$set": { "count": 5 } })
         .await
         .unwrap();
 
@@ -120,7 +115,6 @@ async fn replace_one_archives_pre_replacement_document() {
     let widgets: TrackedCollection<Widget> = TrackedCollection::new(&db, "widgets");
     let id = ObjectId::new();
     widgets
-        .collection()
         .insert_one(Widget {
             id,
             name: "bolt".to_string(),
@@ -169,7 +163,6 @@ async fn delete_one_archives_pre_delete_document() {
     let widgets: TrackedCollection<Widget> = TrackedCollection::new(&db, "widgets");
     let id = ObjectId::new();
     widgets
-        .collection()
         .insert_one(Widget {
             id,
             name: "nut".to_string(),
@@ -205,7 +198,6 @@ async fn delete_many_archives_one_entry_per_matched_document() {
     let widgets: TrackedCollection<Widget> = TrackedCollection::new(&db, "widgets");
     for _ in 0..3 {
         widgets
-            .collection()
             .insert_one(Widget {
                 id: ObjectId::new(),
                 name: "washer".to_string(),
@@ -231,11 +223,7 @@ async fn delete_many_archives_one_entry_per_matched_document() {
     assert_eq!(history.len(), 3);
     assert!(history.iter().all(|e| e.operation == Operation::Delete));
 
-    let remaining = widgets
-        .collection()
-        .count_documents(doc! {})
-        .await
-        .unwrap();
+    let remaining = widgets.collection().count_documents(doc! {}).await.unwrap();
     assert_eq!(remaining, 0);
 }
 
@@ -245,7 +233,6 @@ async fn concurrent_update_one_retries_transient_conflicts_and_archives_exactly_
     let widgets: TrackedCollection<Widget> = TrackedCollection::new(&db, "widgets");
     let id = ObjectId::new();
     widgets
-        .collection()
         .insert_one(Widget {
             id,
             name: "cog".to_string(),
@@ -300,7 +287,6 @@ async fn failed_mutation_leaves_no_history_and_no_change() {
     let widgets: TrackedCollection<Widget> = TrackedCollection::new(&db, "widgets");
     let id = ObjectId::new();
     widgets
-        .collection()
         .insert_one(Widget {
             id,
             name: "rivet".to_string(),
@@ -348,7 +334,6 @@ async fn bulk_write_mixed_operations_archives_correctly() {
     let update_id = ObjectId::new();
     let delete_id = ObjectId::new();
     widgets
-        .collection()
         .insert_one(Widget {
             id: update_id,
             name: "clamp".to_string(),
@@ -357,7 +342,6 @@ async fn bulk_write_mixed_operations_archives_correctly() {
         .await
         .unwrap();
     widgets
-        .collection()
         .insert_one(Widget {
             id: delete_id,
             name: "hinge".to_string(),
@@ -440,7 +424,6 @@ async fn bulk_write_many_variants_archive_one_entry_per_document() {
     let widgets: TrackedCollection<Widget> = TrackedCollection::new(&db, "widgets");
     for _ in 0..3 {
         widgets
-            .collection()
             .insert_one(Widget {
                 id: ObjectId::new(),
                 name: "spring".to_string(),
@@ -451,7 +434,6 @@ async fn bulk_write_many_variants_archive_one_entry_per_document() {
     }
     for _ in 0..2 {
         widgets
-            .collection()
             .insert_one(Widget {
                 id: ObjectId::new(),
                 name: "rod".to_string(),
@@ -505,7 +487,6 @@ async fn bulk_write_failure_leaves_no_history_and_no_change() {
     let widgets: TrackedCollection<Widget> = TrackedCollection::new(&db, "widgets");
     let id = ObjectId::new();
     widgets
-        .collection()
         .insert_one(Widget {
             id,
             name: "washer".to_string(),
@@ -624,4 +605,67 @@ async fn prune_history_older_than_deletes_only_old_entries() {
         .unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].document.name, "recent");
+}
+
+#[tokio::test]
+async fn insert_one_inserts_document_without_archiving() {
+    let db = test_db("insert_one").await;
+    let widgets: TrackedCollection<Widget> = TrackedCollection::new(&db, "widgets");
+    let id = ObjectId::new();
+
+    widgets
+        .insert_one(Widget {
+            id,
+            name: "screw".to_string(),
+            count: 1,
+        })
+        .await
+        .unwrap();
+
+    let current = widgets
+        .collection()
+        .find_one(doc! { "_id": id })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.name, "screw");
+
+    let history_count = widgets.history().count_documents(doc! {}).await.unwrap();
+    assert_eq!(history_count, 0);
+}
+
+#[tokio::test]
+async fn insert_many_inserts_documents_without_archiving() {
+    let db = test_db("insert_many").await;
+    let widgets: TrackedCollection<Widget> = TrackedCollection::new(&db, "widgets");
+    let documents = vec![
+        Widget {
+            id: ObjectId::new(),
+            name: "bracket".to_string(),
+            count: 1,
+        },
+        Widget {
+            id: ObjectId::new(),
+            name: "bracket".to_string(),
+            count: 1,
+        },
+        Widget {
+            id: ObjectId::new(),
+            name: "bracket".to_string(),
+            count: 1,
+        },
+    ];
+
+    let result = widgets.insert_many(documents).await.unwrap();
+    assert_eq!(result.inserted_ids.len(), 3);
+
+    let count = widgets
+        .collection()
+        .count_documents(doc! { "name": "bracket" })
+        .await
+        .unwrap();
+    assert_eq!(count, 3);
+
+    let history_count = widgets.history().count_documents(doc! {}).await.unwrap();
+    assert_eq!(history_count, 0);
 }

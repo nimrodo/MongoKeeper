@@ -27,8 +27,11 @@ orders
 If any step fails, the transaction is aborted: no document is archived without its mutation
 succeeding, and no mutation succeeds without its previous version being archived.
 
-Reads (`find`, `find_one`, etc.) and any operation not listed above pass straight through via
-`.collection()`. Query the history directly via `.history()`.
+`insert_one`/`insert_many` are also available directly on `TrackedCollection` — thin
+passthroughs with nothing to archive, since a newly-inserted document has no previous version.
+
+Reads (`find`, `find_one`, etc.) and any other operation not covered by this type pass straight
+through via `.collection()`. Query the history directly via `.history()`.
 
 Transactions that fail with a transient error (a write conflict, a replica set election, etc.)
 are retried automatically, following the retry pattern recommended by MongoDB's own
