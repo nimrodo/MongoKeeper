@@ -1,16 +1,16 @@
 //! [`TrackedCollection`], a MongoDB collection wrapper that archives previous document
 //! versions on update, replace, and delete.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use bson::Document;
+use bson::{Document, doc};
 use mongodb::error::{TRANSIENT_TRANSACTION_ERROR, UNKNOWN_TRANSACTION_COMMIT_RESULT};
 use mongodb::options::{
-    DeleteManyModel, DeleteOneModel, UpdateManyModel, UpdateModifications, UpdateOneModel,
-    WriteModel,
+    DeleteManyModel, DeleteOneModel, IndexOptions, UpdateManyModel, UpdateModifications,
+    UpdateOneModel, WriteModel,
 };
 use mongodb::results::{DeleteResult, SummaryBulkWriteResult, UpdateResult};
-use mongodb::{Client, ClientSession, Collection, Database};
+use mongodb::{Client, ClientSession, Collection, Database, IndexModel};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::error::Result;
@@ -140,6 +140,41 @@ where
     /// The history collection that archived versions are stored in.
     pub fn history(&self) -> &Collection<HistoryEntry<T>> {
         &self.history
+    }
+
+    /// Creates a TTL index on the history collection's `archived_at` field, so MongoDB
+    /// automatically deletes archived entries older than `max_age`.
+    ///
+    /// This is best-effort and server-driven: MongoDB sweeps for expired documents roughly
+    /// once every 60 seconds, so entries may briefly outlive `max_age` before being removed.
+    /// For deterministic on-demand deletion, use [`prune_history_older_than`] instead.
+    ///
+    /// Safe to call more than once (e.g. on every application startup) with the same
+    /// `max_age` — creating an identical index is a no-op. Calling it again with a
+    /// *different* `max_age` requires the existing index to be dropped first (MongoDB rejects
+    /// changing an existing TTL index's expiry via `create_index`); the driver's error in that
+    /// case is returned as-is so the caller can decide whether to drop and recreate.
+    ///
+    /// [`prune_history_older_than`]: Self::prune_history_older_than
+    pub async fn ensure_history_ttl_index(&self, max_age: Duration) -> Result<()> {
+        let model = IndexModel::builder()
+            .keys(doc! { "archived_at": 1 })
+            .options(IndexOptions::builder().expire_after(max_age).build())
+            .build();
+        self.history.create_index(model).await?;
+        Ok(())
+    }
+
+    /// Deletes every history entry archived more than `max_age` ago. Unlike the TTL index,
+    /// this runs immediately and deterministically when called, rather than waiting on
+    /// MongoDB's background TTL sweep. Returns the number of deleted entries.
+    pub async fn prune_history_older_than(&self, max_age: Duration) -> Result<u64> {
+        let cutoff = bson::DateTime::from_system_time(SystemTime::now() - max_age);
+        let result = self
+            .history
+            .delete_many(doc! { "archived_at": { "$lt": cutoff } })
+            .await?;
+        Ok(result.deleted_count)
     }
 
     /// Archives the current version of every document matching `filter`, then applies

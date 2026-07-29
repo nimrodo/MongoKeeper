@@ -5,10 +5,12 @@
 //! uniquely-named database (dropped at the start of the test) so tests can run concurrently
 //! without interfering and remain independent of leftover data from previous runs.
 
+use std::time::{Duration, SystemTime};
+
 use bson::{doc, oid::ObjectId};
 use futures_util::TryStreamExt;
 use mongodb::{Client, Database};
-use mongokeeper::{BulkWriteModel, Operation, TrackedCollection};
+use mongokeeper::{BulkWriteModel, HistoryEntry, Operation, TrackedCollection};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -536,4 +538,90 @@ async fn bulk_write_failure_leaves_no_history_and_no_change() {
         .unwrap()
         .unwrap();
     assert_eq!(current.count, 1);
+}
+
+#[tokio::test]
+async fn ensure_history_ttl_index_creates_expiring_index_on_archived_at() {
+    let db = test_db("ttl_index").await;
+    let widgets: TrackedCollection<Widget> = TrackedCollection::new(&db, "widgets");
+
+    widgets
+        .ensure_history_ttl_index(Duration::from_secs(3600))
+        .await
+        .unwrap();
+
+    let indexes: Vec<_> = widgets
+        .history()
+        .list_indexes()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    let ttl_index = indexes
+        .iter()
+        .find(|idx| idx.keys.get("archived_at").is_some())
+        .expect("TTL index on archived_at should exist");
+    let expire_after = ttl_index
+        .options
+        .as_ref()
+        .and_then(|o| o.expire_after)
+        .expect("index should have expire_after set");
+    assert_eq!(expire_after, Duration::from_secs(3600));
+
+    // Calling it again with the same max_age is a no-op, not an error.
+    widgets
+        .ensure_history_ttl_index(Duration::from_secs(3600))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn prune_history_older_than_deletes_only_old_entries() {
+    let db = test_db("prune_history").await;
+    let widgets: TrackedCollection<Widget> = TrackedCollection::new(&db, "widgets");
+
+    let old_entry = HistoryEntry {
+        archived_at: bson::DateTime::from_system_time(
+            SystemTime::now() - Duration::from_secs(3600),
+        ),
+        operation: Operation::Update,
+        document: Widget {
+            id: ObjectId::new(),
+            name: "old".to_string(),
+            count: 1,
+        },
+    };
+    let recent_entry = HistoryEntry {
+        archived_at: bson::DateTime::from_system_time(SystemTime::now()),
+        operation: Operation::Update,
+        document: Widget {
+            id: ObjectId::new(),
+            name: "recent".to_string(),
+            count: 1,
+        },
+    };
+    widgets
+        .history()
+        .insert_many(vec![old_entry, recent_entry])
+        .await
+        .unwrap();
+
+    let deleted = widgets
+        .prune_history_older_than(Duration::from_secs(1800))
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1);
+
+    let remaining: Vec<_> = widgets
+        .history()
+        .find(doc! {})
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].document.name, "recent");
 }

@@ -109,6 +109,24 @@ let mut history = orders.history().find(doc! {}).await?;
 
 See `examples/basic_usage.rs` for a complete runnable example.
 
+## History pruning
+
+History collections grow unboundedly by default. Two ways to bound them:
+
+```rust
+use std::time::Duration;
+
+// Set-and-forget: MongoDB automatically deletes entries older than 30 days. Safe to call on
+// every startup. Deletion is best-effort — MongoDB sweeps for expired documents roughly once
+// every 60 seconds, so entries may briefly outlive this window.
+orders
+    .ensure_history_ttl_index(Duration::from_secs(30 * 24 * 3600))
+    .await?;
+
+// On-demand: deletes matching entries immediately and returns how many were removed.
+let deleted = orders.prune_history_older_than(Duration::from_secs(30 * 24 * 3600)).await?;
+```
+
 ## History document shape
 
 ```rust
