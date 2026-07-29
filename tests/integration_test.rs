@@ -2,7 +2,8 @@
 //!
 //! Set `MONGODB_URI` to point at a replica set (transactions require one; a standalone
 //! `mongod` will fail). See the README for how to run one locally. Each test uses a
-//! uniquely-named database so tests can run concurrently without interfering.
+//! uniquely-named database (dropped at the start of the test) so tests can run concurrently
+//! without interfering and remain independent of leftover data from previous runs.
 
 use bson::{doc, oid::ObjectId};
 use futures_util::TryStreamExt;
@@ -24,7 +25,11 @@ async fn test_db(name: &str) -> Database {
     let client = Client::with_uri_str(&uri)
         .await
         .expect("connect to MongoDB (requires a reachable replica set)");
-    client.database(&format!("mongokeeper_test_{name}"))
+    let db = client.database(&format!("mongokeeper_test_{name}"));
+    // Each test uses a fixed database name; drop any leftover data from a previous run so
+    // tests stay independent of run history.
+    db.drop().await.expect("drop stale test database");
+    db
 }
 
 #[tokio::test]
@@ -230,6 +235,46 @@ async fn delete_many_archives_one_entry_per_matched_document() {
         .await
         .unwrap();
     assert_eq!(remaining, 0);
+}
+
+#[tokio::test]
+async fn concurrent_update_one_retries_transient_conflicts_and_archives_exactly_once_each() {
+    let db = test_db("concurrent_update").await;
+    let widgets: TrackedCollection<Widget> = TrackedCollection::new(&db, "widgets");
+    let id = ObjectId::new();
+    widgets
+        .collection()
+        .insert_one(Widget {
+            id,
+            name: "cog".to_string(),
+            count: 0,
+        })
+        .await
+        .unwrap();
+
+    // Two concurrent update_one calls against the same document provoke a write conflict:
+    // whichever transaction loses the conflict fails with a TransientTransactionError, which
+    // TrackedCollection retries automatically until it succeeds.
+    let (r1, r2) = tokio::join!(
+        widgets.update_one(doc! { "_id": id }, doc! { "$set": { "count": 1 } }),
+        widgets.update_one(doc! { "_id": id }, doc! { "$set": { "count": 2 } }),
+    );
+    r1.unwrap();
+    r2.unwrap();
+
+    let history: Vec<_> = widgets
+        .history()
+        .find(doc! { "document._id": id })
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    // Exactly one archived pre-image per successful update, no extras from aborted/retried
+    // attempts (their archive inserts were rolled back along with the rest of the transaction).
+    assert_eq!(history.len(), 2);
+    assert!(history.iter().all(|e| e.operation == Operation::Update));
 }
 
 #[tokio::test]
