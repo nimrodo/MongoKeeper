@@ -30,6 +30,36 @@ succeeding, and no mutation succeeds without its previous version being archived
 Reads (`find`, `find_one`, etc.) and any operation not listed above pass straight through via
 `.collection()`. Query the history directly via `.history()`.
 
+Transactions that fail with a transient error (a write conflict, a replica set election, etc.)
+are retried automatically, following the retry pattern recommended by MongoDB's own
+transactions documentation. Retries continue for up to two minutes before the error is
+returned to the caller.
+
+## Bulk writes
+
+`bulk_write` submits a batch of insert/update/replace/delete operations as a single MongoDB
+`bulkWrite` command, archiving a pre-image for every document any update/replace/delete model
+in the batch matches — all atomically, in one transaction:
+
+```rust
+use mongokeeper::BulkWriteModel;
+
+orders
+    .bulk_write(vec![
+        BulkWriteModel::UpdateMany {
+            filter: doc! { "status": "pending" },
+            update: doc! { "$set": { "status": "shipped" } },
+        },
+        BulkWriteModel::DeleteOne {
+            filter: doc! { "status": "cancelled" },
+        },
+    ])
+    .await?;
+```
+
+`bulk_write` requires **MongoDB server 8.0 or later**, in addition to the replica-set
+requirement below.
+
 ## Requirements
 
 **This crate requires MongoDB transactions, which require a replica set or sharded

@@ -8,7 +8,7 @@
 use bson::{doc, oid::ObjectId};
 use futures_util::TryStreamExt;
 use mongodb::{Client, Database};
-use mongokeeper::{Operation, TrackedCollection};
+use mongokeeper::{BulkWriteModel, Operation, TrackedCollection};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -337,4 +337,203 @@ async fn failed_mutation_leaves_no_history_and_no_change() {
         .unwrap()
         .unwrap();
     assert_eq!(current.name, "rivet");
+}
+
+#[tokio::test]
+async fn bulk_write_mixed_operations_archives_correctly() {
+    let db = test_db("bulk_write_mixed").await;
+    let widgets: TrackedCollection<Widget> = TrackedCollection::new(&db, "widgets");
+    let update_id = ObjectId::new();
+    let delete_id = ObjectId::new();
+    widgets
+        .collection()
+        .insert_one(Widget {
+            id: update_id,
+            name: "clamp".to_string(),
+            count: 1,
+        })
+        .await
+        .unwrap();
+    widgets
+        .collection()
+        .insert_one(Widget {
+            id: delete_id,
+            name: "hinge".to_string(),
+            count: 1,
+        })
+        .await
+        .unwrap();
+
+    let insert_id = ObjectId::new();
+    let summary = widgets
+        .bulk_write(vec![
+            BulkWriteModel::InsertOne(Widget {
+                id: insert_id,
+                name: "pin".to_string(),
+                count: 1,
+            }),
+            BulkWriteModel::UpdateOne {
+                filter: doc! { "_id": update_id },
+                update: doc! { "$set": { "count": 2 } },
+            },
+            BulkWriteModel::DeleteOne {
+                filter: doc! { "_id": delete_id },
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(summary.inserted_count, 1);
+    assert_eq!(summary.modified_count, 1);
+    assert_eq!(summary.deleted_count, 1);
+
+    let history: Vec<_> = widgets
+        .history()
+        .find(doc! {})
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    assert!(
+        history
+            .iter()
+            .any(|e| e.document.id == update_id && e.operation == Operation::Update)
+    );
+    assert!(
+        history
+            .iter()
+            .any(|e| e.document.id == delete_id && e.operation == Operation::Delete)
+    );
+
+    assert!(
+        widgets
+            .collection()
+            .find_one(doc! { "_id": insert_id })
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        widgets
+            .collection()
+            .find_one(doc! { "_id": delete_id })
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let updated = widgets
+        .collection()
+        .find_one(doc! { "_id": update_id })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.count, 2);
+}
+
+#[tokio::test]
+async fn bulk_write_many_variants_archive_one_entry_per_document() {
+    let db = test_db("bulk_write_many").await;
+    let widgets: TrackedCollection<Widget> = TrackedCollection::new(&db, "widgets");
+    for _ in 0..3 {
+        widgets
+            .collection()
+            .insert_one(Widget {
+                id: ObjectId::new(),
+                name: "spring".to_string(),
+                count: 1,
+            })
+            .await
+            .unwrap();
+    }
+    for _ in 0..2 {
+        widgets
+            .collection()
+            .insert_one(Widget {
+                id: ObjectId::new(),
+                name: "rod".to_string(),
+                count: 1,
+            })
+            .await
+            .unwrap();
+    }
+
+    widgets
+        .bulk_write(vec![
+            BulkWriteModel::UpdateMany {
+                filter: doc! { "name": "spring" },
+                update: doc! { "$set": { "count": 9 } },
+            },
+            BulkWriteModel::DeleteMany {
+                filter: doc! { "name": "rod" },
+            },
+        ])
+        .await
+        .unwrap();
+
+    let history: Vec<_> = widgets
+        .history()
+        .find(doc! {})
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 5);
+    assert_eq!(
+        history
+            .iter()
+            .filter(|e| e.operation == Operation::Update)
+            .count(),
+        3
+    );
+    assert_eq!(
+        history
+            .iter()
+            .filter(|e| e.operation == Operation::Delete)
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn bulk_write_failure_leaves_no_history_and_no_change() {
+    let db = test_db("bulk_write_rollback").await;
+    let widgets: TrackedCollection<Widget> = TrackedCollection::new(&db, "widgets");
+    let id = ObjectId::new();
+    widgets
+        .collection()
+        .insert_one(Widget {
+            id,
+            name: "washer".to_string(),
+            count: 1,
+        })
+        .await
+        .unwrap();
+
+    // An empty update document is rejected by MongoDB ("no operations in update"), so the
+    // whole bulk write (and its transaction) should fail and roll back.
+    let result = widgets
+        .bulk_write(vec![BulkWriteModel::UpdateOne {
+            filter: doc! { "_id": id },
+            update: doc! {},
+        }])
+        .await;
+    assert!(result.is_err());
+
+    let history_count = widgets
+        .history()
+        .count_documents(doc! { "document._id": id })
+        .await
+        .unwrap();
+    assert_eq!(history_count, 0);
+
+    let current = widgets
+        .collection()
+        .find_one(doc! { "_id": id })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.count, 1);
 }

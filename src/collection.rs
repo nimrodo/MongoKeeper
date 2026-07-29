@@ -5,7 +5,11 @@ use std::time::{Duration, Instant};
 
 use bson::Document;
 use mongodb::error::{TRANSIENT_TRANSACTION_ERROR, UNKNOWN_TRANSACTION_COMMIT_RESULT};
-use mongodb::results::{DeleteResult, UpdateResult};
+use mongodb::options::{
+    DeleteManyModel, DeleteOneModel, UpdateManyModel, UpdateModifications, UpdateOneModel,
+    WriteModel,
+};
+use mongodb::results::{DeleteResult, SummaryBulkWriteResult, UpdateResult};
 use mongodb::{Client, ClientSession, Collection, Database};
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -64,6 +68,46 @@ pub struct TrackedCollection<T: Send + Sync> {
     client: Client,
     collection: Collection<T>,
     history: Collection<HistoryEntry<T>>,
+}
+
+/// A single operation to submit as part of a [`TrackedCollection::bulk_write`] call, scoped to
+/// the collection being wrapped.
+pub enum BulkWriteModel<T> {
+    /// Inserts `T`. Nothing is archived, since there is no previous version.
+    InsertOne(T),
+    /// Archives the current version of the first document matching `filter`, then updates it.
+    UpdateOne {
+        /// The filter selecting which document to update.
+        filter: Document,
+        /// The update to apply.
+        update: Document,
+    },
+    /// Archives the current version of every document matching `filter`, then updates all of
+    /// them.
+    UpdateMany {
+        /// The filter selecting which documents to update.
+        filter: Document,
+        /// The update to apply.
+        update: Document,
+    },
+    /// Archives the current version of the first document matching `filter`, then replaces it.
+    ReplaceOne {
+        /// The filter selecting which document to replace.
+        filter: Document,
+        /// The document to replace it with.
+        replacement: T,
+    },
+    /// Archives the current version of the first document matching `filter`, then deletes it.
+    DeleteOne {
+        /// The filter selecting which document to delete.
+        filter: Document,
+    },
+    /// Archives the current version of every document matching `filter`, then deletes all of
+    /// them.
+    DeleteMany {
+        /// The filter selecting which documents to delete.
+        filter: Document,
+    },
 }
 
 impl<T> TrackedCollection<T>
@@ -152,19 +196,89 @@ where
         .await
     }
 
-    /// Runs the archive-then-mutate pattern shared by every mutating method inside a
-    /// transaction: read every document matching `filter`, insert a [`HistoryEntry`] for each
-    /// into the history collection, then run `mutate`, then commit.
+    /// Submits every model in `models` as a single MongoDB `bulkWrite` command, archiving the
+    /// current version of every document any update/replace/delete model matches before the
+    /// batch is applied — all atomically, within one transaction.
     ///
-    /// If the transaction fails with a transient error (a write conflict, a replica set
-    /// election, etc.), the whole attempt — archive included — is retried from scratch, since
-    /// the transaction's read snapshot no longer applies. Retries continue for up to
-    /// [`RETRY_TIMEOUT`] before the error is returned to the caller.
+    /// # Requirements
+    ///
+    /// In addition to the replica-set requirement common to every mutating method on this
+    /// type, `bulk_write` requires **MongoDB server 8.0 or later** (the `bulkWrite` command
+    /// this method uses does not exist on older servers).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use mongodb::Client;
+    /// # use mongokeeper::{BulkWriteModel, TrackedCollection};
+    /// # use serde::{Deserialize, Serialize};
+    /// # #[derive(Debug, Clone, Serialize, Deserialize)]
+    /// # struct Order { #[serde(rename = "_id")] id: bson::oid::ObjectId, status: String }
+    /// # async fn run() -> mongokeeper::Result<()> {
+    /// # let client = Client::with_uri_str("mongodb://localhost:27017").await?;
+    /// # let db = client.database("shop");
+    /// let orders: TrackedCollection<Order> = TrackedCollection::new(&db, "orders");
+    /// orders
+    ///     .bulk_write(vec![
+    ///         BulkWriteModel::UpdateMany {
+    ///             filter: bson::doc! { "status": "pending" },
+    ///             update: bson::doc! { "$set": { "status": "shipped" } },
+    ///         },
+    ///         BulkWriteModel::DeleteOne {
+    ///             filter: bson::doc! { "status": "cancelled" },
+    ///         },
+    ///     ])
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn bulk_write(
+        &self,
+        models: Vec<BulkWriteModel<T>>,
+    ) -> Result<SummaryBulkWriteResult> {
+        self.with_transaction(async |session| {
+            let mut write_models = Vec::with_capacity(models.len());
+            for model in &models {
+                if let Some((filter, operation)) = model.archive_target() {
+                    self.archive_matching(session, filter, operation).await?;
+                }
+                write_models.push(model.to_write_model(&self.collection)?);
+            }
+
+            self.client
+                .bulk_write(write_models)
+                .session(session)
+                .await
+        })
+        .await
+    }
+
+    /// Runs the archive-then-mutate pattern shared by every single-operation mutating method
+    /// inside a transaction: read every document matching `filter`, insert a [`HistoryEntry`]
+    /// for each into the history collection, then run `mutate`, then commit.
     async fn run_transaction<R>(
         &self,
         filter: Document,
         operation: Operation,
         mut mutate: impl AsyncFnMut(&mut ClientSession, Document) -> mongodb::error::Result<R>,
+    ) -> Result<R> {
+        self.with_transaction(async |session| {
+            self.archive_matching(session, filter.clone(), operation)
+                .await?;
+            mutate(session, filter.clone()).await
+        })
+        .await
+    }
+
+    /// Runs `body` inside a MongoDB transaction and commits it.
+    ///
+    /// If `body` fails with a transient error (a write conflict, a replica set election, etc.),
+    /// the whole attempt is retried from scratch, since the transaction's read snapshot no
+    /// longer applies. Retries continue for up to [`RETRY_TIMEOUT`] before the error is
+    /// returned to the caller.
+    async fn with_transaction<R>(
+        &self,
+        mut body: impl AsyncFnMut(&mut ClientSession) -> mongodb::error::Result<R>,
     ) -> Result<R> {
         let deadline = Instant::now() + RETRY_TIMEOUT;
 
@@ -172,15 +286,7 @@ where
             let mut session = self.client.start_session().await?;
             session.start_transaction().await?;
 
-            let outcome = match self
-                .archive_matching(&mut session, filter.clone(), operation)
-                .await
-            {
-                Ok(()) => mutate(&mut session, filter.clone()).await,
-                Err(err) => Err(err),
-            };
-
-            match outcome {
+            match body(&mut session).await {
                 Ok(value) => match self.commit(&mut session).await {
                     Ok(()) => return Ok(value),
                     Err(err) => return Err(err.into()),
@@ -233,6 +339,62 @@ where
         }
 
         Ok(())
+    }
+}
+
+impl<T> BulkWriteModel<T>
+where
+    T: Serialize + Send + Sync,
+{
+    /// The filter and [`Operation`] to archive under before this model is applied, or `None`
+    /// for `InsertOne` (nothing to archive).
+    fn archive_target(&self) -> Option<(Document, Operation)> {
+        match self {
+            BulkWriteModel::InsertOne(_) => None,
+            BulkWriteModel::UpdateOne { filter, .. } | BulkWriteModel::UpdateMany { filter, .. } => {
+                Some((filter.clone(), Operation::Update))
+            }
+            BulkWriteModel::ReplaceOne { filter, .. } => Some((filter.clone(), Operation::Replace)),
+            BulkWriteModel::DeleteOne { filter } | BulkWriteModel::DeleteMany { filter } => {
+                Some((filter.clone(), Operation::Delete))
+            }
+        }
+    }
+
+    /// Converts this model into the driver's [`WriteModel`], scoped to `collection`'s
+    /// namespace.
+    fn to_write_model(&self, collection: &Collection<T>) -> mongodb::error::Result<WriteModel> {
+        let namespace = collection.namespace();
+        Ok(match self {
+            BulkWriteModel::InsertOne(document) => {
+                collection.insert_one_model(document)?.into()
+            }
+            BulkWriteModel::UpdateOne { filter, update } => UpdateOneModel::builder()
+                .namespace(namespace)
+                .filter(filter.clone())
+                .update(UpdateModifications::Document(update.clone()))
+                .build()
+                .into(),
+            BulkWriteModel::UpdateMany { filter, update } => UpdateManyModel::builder()
+                .namespace(namespace)
+                .filter(filter.clone())
+                .update(UpdateModifications::Document(update.clone()))
+                .build()
+                .into(),
+            BulkWriteModel::ReplaceOne { filter, replacement } => collection
+                .replace_one_model(filter.clone(), replacement)?
+                .into(),
+            BulkWriteModel::DeleteOne { filter } => DeleteOneModel::builder()
+                .namespace(namespace)
+                .filter(filter.clone())
+                .build()
+                .into(),
+            BulkWriteModel::DeleteMany { filter } => DeleteManyModel::builder()
+                .namespace(namespace)
+                .filter(filter.clone())
+                .build()
+                .into(),
+        })
     }
 }
 

@@ -47,6 +47,7 @@ mod collection;
 mod error;
 mod history;
 
-pub use collection::TrackedCollection;
+pub use collection::{BulkWriteModel, TrackedCollection};
 pub use error::{Error, Result};
 pub use history::{HistoryEntry, Operation};
+pub use mongodb::results::SummaryBulkWriteResult;
