@@ -68,7 +68,14 @@ requirement below.
 **This crate requires MongoDB transactions, which require a replica set or sharded
 cluster.** A standalone `mongod` will return an error on every mutating call.
 
-To run a single-node replica set locally for development or testing:
+To run a single-node replica set locally for development or testing, either use the bundled
+`docker-compose.yml` (recommended — starts MongoDB and initializes the replica set for you):
+
+```sh
+docker compose up -d
+```
+
+or start one manually:
 
 ```sh
 mongod --replSet rs0 --dbpath /path/to/data --port 27017
@@ -76,7 +83,7 @@ mongod --replSet rs0 --dbpath /path/to/data --port 27017
 mongosh --port 27017 --eval "rs.initiate()"
 ```
 
-Then point the driver at it with a `replicaSet` connection string parameter, e.g.
+Either way, point the driver at it with a `replicaSet` connection string parameter, e.g.
 `mongodb://localhost:27017/?replicaSet=rs0`.
 
 ## Usage
@@ -147,7 +154,10 @@ cargo build
 cargo test --lib          # unit tests, no database needed
 
 # integration tests need a replica set reachable via MONGODB_URI:
-export MONGODB_URI="mongodb://localhost:27117/?replicaSet=rs0"
+docker compose up -d
+export MONGODB_URI="mongodb://localhost:27017/?replicaSet=rs0"
 cargo test --tests
 cargo run --example basic_usage
+
+docker compose down        # when you're done
 ```
