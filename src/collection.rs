@@ -445,10 +445,14 @@ where
                     Err(err) => return Err(err.into()),
                 },
                 Err(err) if is_transient_transaction_error(&err) && Instant::now() < deadline => {
+                    tracing::warn!(error = %err, "transient transaction error, retrying");
                     let _ = session.abort_transaction().await;
                     continue;
                 }
                 Err(err) => {
+                    if is_transient_transaction_error(&err) {
+                        tracing::error!(error = %err, "transient transaction error, giving up after retry timeout");
+                    }
                     session.abort_transaction().await?;
                     return Err(err.into());
                 }
@@ -464,9 +468,15 @@ where
             match session.commit_transaction().await {
                 Ok(()) => return Ok(()),
                 Err(err) if is_unknown_commit_result(&err) && Instant::now() < deadline => {
+                    tracing::warn!(error = %err, "unknown commit result, retrying");
                     continue;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    if is_unknown_commit_result(&err) {
+                        tracing::error!(error = %err, "unknown commit result, giving up after retry timeout");
+                    }
+                    return Err(err);
+                }
             }
         }
     }

@@ -9,6 +9,7 @@ futures-util = { version = "0.3.33", features = ["std"] }
 mongodb = { version = "3.8.0", default-features = false, features = ["bson-3", "rustls-tls", "dns-resolver", "compat-3-3-0"] }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.19"
+tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
